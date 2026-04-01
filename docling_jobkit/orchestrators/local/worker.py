@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Union
@@ -18,6 +19,19 @@ if TYPE_CHECKING:
     from docling_jobkit.orchestrators.local.orchestrator import LocalOrchestrator
 
 _log = logging.getLogger(__name__)
+
+
+def _apply_torch_num_threads() -> None:
+    target = os.environ.get("OMP_NUM_THREADS")
+    if target is None:
+        return
+
+    try:
+        import torch
+
+        torch.set_num_threads(int(target))
+    except Exception:
+        pass
 
 
 class AsyncLocalWorker:
@@ -40,11 +54,18 @@ class AsyncLocalWorker:
         else:
             cm = DoclingConverterManager(self.orchestrator.cm.config)
             self.orchestrator.worker_cms.append(cm)
+
+            def preload_formats() -> None:
+                # PyTorch thread settings can drift on reused executor threads.
+                # Re-apply the configured thread budget before heavy model warmup.
+                _apply_torch_num_threads()
+                cm.preload_additional_formats()
+
             # Pre-warm additional pipelines on this worker's own manager.
             # Shared managers are pre-warmed centrally in warm_up_caches().
             # Run off the event loop to avoid blocking health checks and
             # other workers during heavy model loading.
-            await asyncio.to_thread(cm.preload_additional_formats)
+            await asyncio.to_thread(preload_formats)
         while True:
             task_id: str = await self.orchestrator.task_queue.get()
             self.orchestrator.queue_list.remove(task_id)
@@ -56,7 +77,6 @@ class AsyncLocalWorker:
 
             try:
                 task.set_status(TaskStatus.STARTED)
-                _log.info(f"Worker {self.worker_id} processing task {task_id}")
 
                 if self.orchestrator.notifier:
                     # Notify clients about task updates
@@ -76,6 +96,10 @@ class AsyncLocalWorker:
 
                 # Define a callback function to send progress updates to the client.
                 def run_task() -> DoclingTaskResult:
+                    # Re-apply the configured thread budget before each
+                    # conversion. ASR inference can otherwise fall back to the
+                    # host CPU-count default on long-lived worker threads.
+                    _apply_torch_num_threads()
                     convert_sources: list[Union[str, DocumentStream]] = []
                     headers: Optional[dict[str, Any]] = None
                     for source in task.sources:

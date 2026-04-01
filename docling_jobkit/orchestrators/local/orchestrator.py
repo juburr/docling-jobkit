@@ -126,16 +126,26 @@ class LocalOrchestrator(BaseOrchestrator):
         _log.debug("All workers completed.")
 
     async def warm_up_caches(self):
-        # Converter with default options
-        pdf_format_option = self.cm.get_pdf_pipeline_opts(ConvertDocumentsOptions())
+        # Resolve default options from config so the warmed converter's
+        # cache key matches the one that real requests will hit.
+        if self.cm.config.preload_default_options is not None:
+            options = ConvertDocumentsOptions.model_validate(
+                self.cm.config.preload_default_options
+            )
+        else:
+            options = ConvertDocumentsOptions()
+        pdf_format_option = self.cm.get_pdf_pipeline_opts(options)
         converter = self.cm.get_converter(pdf_format_option)
         converter.initialize_pipeline(InputFormat.PDF)
-        # Pre-warm additional configured formats.  This always runs
-        # (regardless of shared_models) so that misconfigured format names
-        # fail startup before the readiness gate opens.  In non-shared
-        # mode the orchestrator copy is not used for requests, but it
-        # serves as config validation and model download.
-        self.cm.preload_additional_formats()
+        if self.config.shared_models:
+            # Shared mode: preload on orchestrator CM (workers reuse it)
+            self.cm.preload_additional_formats()
+        else:
+            # Non-shared mode: validate config only.  Workers load their
+            # own models.  Loading here would waste GPU memory on an extra
+            # copy that never serves requests (N+1 problem), potentially
+            # forcing a worker's model onto CPU.
+            self.cm.validate_preload_formats()
 
     async def delete_task(self, task_id: str):
         _log.info(f"Deleting result of task {task_id=}")

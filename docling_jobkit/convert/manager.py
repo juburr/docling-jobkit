@@ -251,6 +251,17 @@ class DoclingConverterManagerConfig(BaseModel):
         ),
         examples=[["pdf", "audio"]],
     )
+    preload_default_options: Optional[dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "JSON-serialized ConvertDocumentsOptions whose PDF pipeline "
+            "hash must match real requests.  When set, warm_up_caches() "
+            "and preload_additional_formats() use these options to select "
+            "the cached converter, ensuring the preloaded pipelines are "
+            "on the same converter that serves traffic.  If None, bare "
+            "ConvertDocumentsOptions() defaults are used."
+        ),
+    )
 
 
 # Custom serializer for PdfFormatOption
@@ -1199,12 +1210,6 @@ class DoclingConverterManager:
 
         This is a no-op when *preload_formats* is empty.
 
-        The method obtains the same cached ``DocumentConverter`` that
-        :meth:`convert_documents` uses (with default options), so pre-warmed
-        pipelines persist across requests.  Calling this for a format that
-        is already initialized is harmless (the pipeline cache is checked
-        first).
-
         Raises
         ------
         RuntimeError
@@ -1219,7 +1224,13 @@ class DoclingConverterManager:
         if not self.config.preload_formats:
             return
 
-        pdf_opts = self.get_pdf_pipeline_opts(ConvertDocumentsOptions())
+        if self.config.preload_default_options is not None:
+            options = ConvertDocumentsOptions.model_validate(
+                self.config.preload_default_options
+            )
+        else:
+            options = ConvertDocumentsOptions()
+        pdf_opts = self.get_pdf_pipeline_opts(options)
         converter = self.get_converter(pdf_opts)
 
         for fmt_name in self.config.preload_formats:
@@ -1242,3 +1253,29 @@ class DoclingConverterManager:
             _log.info("Pre-warming %s pipeline...", fmt_lower)
             converter.initialize_pipeline(fmt)
             _log.info("Pipeline for %s is ready.", fmt_lower)
+
+    def validate_preload_formats(self) -> None:
+        """Check that all *config.preload_formats* entries are valid.
+
+        Unlike :meth:`preload_additional_formats`, this does **not** create
+        a converter or load any ML models.  Use this for lightweight config
+        validation when the actual loading will happen elsewhere (e.g. in
+        worker processes).
+
+        Raises
+        ------
+        RuntimeError
+            If a configured format name is not a valid ``InputFormat``.
+        """
+        if not self.config.preload_formats:
+            return
+
+        for fmt_name in self.config.preload_formats:
+            fmt_lower = fmt_name.lower()
+            try:
+                InputFormat(fmt_lower)
+            except ValueError:
+                raise RuntimeError(
+                    f"Unknown format '{fmt_name}' in preload_formats. "
+                    f"Valid formats: {[f.value for f in InputFormat]}"
+                )

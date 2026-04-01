@@ -154,6 +154,16 @@ async def _wait_task_complete(
             return False
 
 
+async def _wait_until(predicate, max_wait: float = 10.0, interval: float = 0.1) -> bool:
+    start_time = time.monotonic()
+    while True:
+        if predicate():
+            return True
+        if time.monotonic() - start_time > max_wait:
+            return False
+        await asyncio.sleep(interval)
+
+
 @pytest.mark.asyncio
 async def test_convert_warmup():
     cm_config = DoclingConverterManagerConfig()
@@ -191,13 +201,12 @@ async def test_preload_shared_mode_calls_preload_on_orchestrator_cm():
 
 
 @pytest.mark.asyncio
-async def test_preload_non_shared_mode_still_validates_on_orchestrator_cm():
-    """With shared_models=False, warm_up_caches still calls preload_additional_formats.
+async def test_preload_non_shared_mode_validates_without_loading():
+    """With shared_models=False, warm_up_caches validates format names only.
 
-    Even though non-shared workers create their own managers, the
-    orchestrator CM is pre-loaded to validate the config before the
-    readiness gate opens.  A bad format name will fail startup here
-    rather than silently crashing workers later.
+    The orchestrator CM should NOT load extra models (to avoid the N+1
+    GPU memory problem).  Workers load their own models.  Bad format
+    names should still fail startup.
     """
     from unittest.mock import patch
 
@@ -207,11 +216,15 @@ async def test_preload_non_shared_mode_still_validates_on_orchestrator_cm():
     config = LocalOrchestratorConfig(shared_models=False)
     orchestrator = LocalOrchestrator(config=config, converter_manager=cm)
 
-    with patch.object(
-        cm, "preload_additional_formats", wraps=cm.preload_additional_formats
-    ) as mock_preload:
+    with (
+        patch.object(cm, "preload_additional_formats") as mock_preload,
+        patch.object(
+            cm, "validate_preload_formats", wraps=cm.validate_preload_formats
+        ) as mock_validate,
+    ):
         await orchestrator.warm_up_caches()
-        mock_preload.assert_called_once()
+        mock_preload.assert_not_called()
+        mock_validate.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -224,18 +237,22 @@ async def test_non_shared_workers_preload_own_managers():
     orchestrator = LocalOrchestrator(config=config, converter_manager=cm)
 
     queue_task = asyncio.create_task(orchestrator.process_queue())
-    # Give the worker time to start and pre-warm
-    await asyncio.sleep(0.5)
+
+    assert await _wait_until(lambda: len(orchestrator.worker_cms) == 1)
 
     # Worker should have created its own CM
     assert len(orchestrator.worker_cms) == 1
     worker_cm = orchestrator.worker_cms[0]
 
     # The worker CM should have pre-warmed its converter
-    converter = worker_cm.get_converter(
-        worker_cm.get_pdf_pipeline_opts(ConvertDocumentsOptions())
+    assert await _wait_until(
+        lambda: len(
+            worker_cm.get_converter(
+                worker_cm.get_pdf_pipeline_opts(ConvertDocumentsOptions())
+            ).initialized_pipelines
+        )
+        > 0
     )
-    assert len(converter.initialized_pipelines) > 0
 
     queue_task.cancel()
     try:
@@ -274,6 +291,15 @@ def test_preload_additional_formats_unknown_format_raises():
 
     with pytest.raises(RuntimeError, match="Unknown format"):
         cm.preload_additional_formats()
+
+
+def test_validate_preload_formats_unknown_format_raises():
+    """validate_preload_formats also catches unknown format names."""
+    cm_config = DoclingConverterManagerConfig(preload_formats=["nonexistent_format"])
+    cm = DoclingConverterManager(config=cm_config)
+
+    with pytest.raises(RuntimeError, match="Unknown format"):
+        cm.validate_preload_formats()
 
 
 def test_preload_additional_formats_idempotent():
